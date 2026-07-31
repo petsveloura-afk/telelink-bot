@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: telelink-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: SUPER_ADMIN_IDS
+        sync: false
+      - key: FIREBASE_URL
+        sync: false
+      - key: MAIN_CHANNEL_LINK
+        sync: false
+      - key: HELP_SUPPORT_LINK
+        sync: false
