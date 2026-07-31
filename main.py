@@ -69,8 +69,8 @@ try:
         SQLiteStorage = None  # type: ignore
         _SQLITE_AVAILABLE = False
 
-except ImportError:
-    logger.critical("❌ Missing aiogram library. Run: pip install aiogram")
+except ImportError as exc:
+    logger.critical("❌ Import failure while loading aiogram/aiohttp: %s", exc)
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
