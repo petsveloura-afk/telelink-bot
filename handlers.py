@@ -1180,8 +1180,11 @@ async def _reveal_report_evidence(bot: Bot, chat_id: int, entry: Dict[str, Any])
         if len(photos) == 1:
             await bot.send_photo(chat_id, photo=photos[0], caption="📸 ראיה חזותית שצורפה על ידי המדווח")
         elif len(photos) > 1:
-            media = [InputMediaPhoto(media=fid) for fid in photos[:10]]
-            media[0].caption = f"📸 {len(photos)} ראיות חזותיות שצורפו על ידי המדווח"
+            caption = f"📸 {len(photos)} ראיות חזותיות שצורפו על ידי המדווח"
+            media = [
+                InputMediaPhoto(media=fid, caption=caption if i == 0 else None)
+                for i, fid in enumerate(photos[:10])
+            ]
             await bot.send_media_group(chat_id, media=media)
     except Exception as exc:
         logger.warning("Failed to deliver photo evidence to %s: %s", chat_id, exc)
@@ -1189,7 +1192,7 @@ async def _reveal_report_evidence(bot: Bot, chat_id: int, entry: Dict[str, Any])
             await bot.send_message(chat_id, "⚠️ אירעה שגיאה בטעינת התמונות שצורפו לתיק.")
         except Exception:
             pass
-
+            
     if text_proof:
         try:
             await bot.send_message(
