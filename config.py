@@ -106,3 +106,15 @@ if any(sid not in ADMIN_IDS for sid in SUPER_ADMIN_IDS):
         "⚠️  SUPER_ADMIN_IDS contains IDs not present in ADMIN_IDS — "
         "those super admins will not have panel access. Add them to ADMIN_IDS too."
     )
+
+# NEW — security: warn loudly when the bot runs on the hard-coded fallback token.
+# A token committed to Git must be considered leaked: revoke it in @BotFather
+# (/revoke) and provide the new one only through the BOT_TOKEN environment variable.
+if not os.getenv("BOT_TOKEN"):
+    _cfg_log.warning(
+        "🔐 BOT_TOKEN env var is not set — using the hard-coded fallback token from config.py. "
+        "Rotate it via @BotFather (/revoke) and set BOT_TOKEN in Railway."
+    )
+
+if not os.getenv("DATABASE_URL"):
+    _cfg_log.warning("🗄️ DATABASE_URL is not set — set it to your Neon connection string in Railway.")

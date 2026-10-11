@@ -4,7 +4,8 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PORT=10000
 
 WORKDIR /app
 
@@ -31,5 +32,9 @@ RUN chown -R botuser:botgroup /app
 USER botuser
 
 EXPOSE 10000
+
+# Container-level health probe (the bot serves /health on $PORT)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
+    CMD python -c 'import os,urllib.request as u;u.urlopen("http://127.0.0.1:%s/health"%os.getenv("PORT","10000"),timeout=4)' || exit 1
 
 CMD ["python", "main.py"]

@@ -13,6 +13,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 
 from aiogram import Bot, F, Router
@@ -79,6 +80,14 @@ except ImportError:
         @staticmethod
         async def set_json(path: str, data: Any) -> bool:
             return False
+
+# NEW — mirror of the local JSON files into Postgres (survives Railway redeploys).
+# Imported defensively: if db_local doesn't expose it the bot behaves exactly as before.
+try:
+    from db_local import mirror_file as _db_mirror_file
+except ImportError:  # pragma: no cover
+    async def _db_mirror_file(name: str, data: Any) -> bool:  # type: ignore[misc]
+        return False
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -271,6 +280,38 @@ def parse_label_and_url(raw: str) -> Optional[tuple]:
     return None
 
 # ---------------------------------------------------------------------------
+# NEW — write-through mirror (local JSON file -> Postgres kv_store)
+# Coalesced per file: a burst of writes results in at most one pending upload,
+# always carrying the newest snapshot. Never raises, never blocks the caller.
+# ---------------------------------------------------------------------------
+_mirror_pending: Dict[str, Any] = {}
+_mirror_tasks: Dict[str, "asyncio.Task[None]"] = {}
+
+
+async def _mirror_worker(name: str) -> None:
+    try:
+        while name in _mirror_pending:
+            snapshot = _mirror_pending.pop(name)
+            try:
+                await _db_mirror_file(name, snapshot)
+            except Exception as exc:
+                logger.warning("DB mirror failed for %s: %s", name, exc)
+    finally:
+        _mirror_tasks.pop(name, None)
+
+
+def _schedule_mirror(path: str, data: Any) -> None:
+    try:
+        name = os.path.basename(path)
+        _mirror_pending[name] = json.loads(json.dumps(data, ensure_ascii=False))  # immutable snapshot
+        task = _mirror_tasks.get(name)
+        if task is None or task.done():
+            _mirror_tasks[name] = asyncio.get_running_loop().create_task(_mirror_worker(name))
+    except Exception as exc:
+        logger.debug("Mirror scheduling skipped for %s: %s", path, exc)
+
+
+# ---------------------------------------------------------------------------
 # Thread-safe JSON I/O helpers
 # ---------------------------------------------------------------------------
 async def _read_json_file(path: str, default: Any) -> Any:
@@ -307,7 +348,10 @@ async def _write_json_file(path: str, data: Any) -> bool:
                 pass
             return False
 
-    return await asyncio.to_thread(_write)
+    _ok = await asyncio.to_thread(_write)
+    if _ok:
+        _schedule_mirror(path, data)  # NEW — keep a durable copy in Postgres
+    return _ok
 
 # ---------------------------------------------------------------------------
 # Data access layer
@@ -479,6 +523,8 @@ EDITABLE_BUTTONS: Dict[str, Dict[str, str]] = {
     "main_help":        {"label": "תפריט ראשי · עזרה ותמיכה",           "type": "text", "default_text": "🆘 עזרה ותמיכה"},
     "main_blacklist":   {"label": "תפריט ראשי · אינדקס רשימה שחורה",    "type": "text", "default_text": "🌍 אינדקס רשימה שחורה"},
     "main_pulse":       {"label": "תפריט ראשי · דופק השוק",             "type": "text", "default_text": "🇮🇱 דופק השוק"},
+    "main_tips":        {"label": "תפריט ראשי · טיפים לבטיחות",         "type": "text", "default_text": "💡 טיפים לבטיחות"},
+    "main_faq":         {"label": "תפריט ראשי · שאלות נפוצות",          "type": "text", "default_text": "❓ שאלות נפוצות"},
     "geza_bot":         {"label": "כפתור: בוט הגזע המרכזי",            "type": "url",  "default_text": "🤖 עבור לבוט הגזע המרכזי ➜", "default_url": GEZA_BOT_LINK},
     "main_channel":     {"label": "כפתור: הערוץ הרשמי",                "type": "url",  "default_text": "🔗 הערוץ הרשמי",             "default_url": MAIN_CHANNEL_LINK},
     "help_support":     {"label": "קישור: מרכז התמיכה",                "type": "url",  "default_text": "🆘 עזרה ותמיכה",             "default_url": HELP_SUPPORT_LINK},
@@ -699,6 +745,8 @@ _MAIN_MENU_TEXT_BUTTONS: List[tuple] = [
     ("main_help",        "help_support"),
     ("main_blacklist",   "global_blacklist"),
     ("main_pulse",       "market_pulse"),
+    ("main_tips",        "safety_tips"),
+    ("main_faq",         "faq_menu"),
 ]
 _MAIN_MENU_LINK_BUTTONS: List[str] = ["geza_bot", "main_channel"]
 
@@ -861,7 +909,8 @@ async def start_message(msg: Message, state: FSMContext) -> None:
         "ברוכים הבאים למנוע האימות המתקדם ביותר בישראל.\n"
         "המערכת מגנה עליכם מפני נוכלים ורמאים\n"
         "באמצעות פרוטוקולי אבטחה מחמירים ובדיקה רב-שכבתית.\n\n"
-        "💡 <b>בחרו פעולה מהתפריט:</b>"
+        "💡 <b>בחרו פעולה מהתפריט:</b>\n"
+        "⌨️ <i>קיצורים: /check · /tips · /faq · /help</i>"
     )
 
     try:
@@ -880,6 +929,37 @@ async def start_message(msg: Message, state: FSMContext) -> None:
             await msg.answer(welcome_text, parse_mode=ParseMode.HTML, reply_markup=telelink_main_menu())
         except Exception as exc2:
             logger.error("Cannot send start message: %s", exc2)
+
+# ---------------------------------------------------------------------------
+# NEW — impersonation guard: flags names that imitate a Gold partner
+# (e.g. "shop_l1nk" vs "shop_link", swapped zero/O, extra underscores).
+# Purely advisory — it only ADDS a warning line, it never changes a verdict.
+# ---------------------------------------------------------------------------
+_LEET_MAP = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t", "$": "s"})
+
+
+def _fold_name(value: str) -> str:
+    """Canonical comparison form: lowercase, no separators, look-alike digits folded to letters."""
+    return re.sub(r"[_\-.\s]", "", str(value or "").lower().replace("@", "")).translate(_LEET_MAP)
+
+
+async def _find_lookalike_gold(entity: str) -> Optional[str]:
+    """Return the Gold partner name that `entity` closely imitates (but is not), else None."""
+    entity_clean = str(entity or "").lower().replace("@", "").strip()
+    entity_fold = _fold_name(entity_clean)
+    if len(entity_fold) < 4:
+        return None
+    for g in await load_gold_list():
+        if not isinstance(g, dict):
+            continue
+        name = str(g.get("name", "")).strip()
+        gold_clean = name.lower().replace("@", "").strip()
+        gold_fold = _fold_name(name)
+        if len(gold_fold) < 4 or gold_clean == entity_clean:
+            continue
+        if entity_fold == gold_fold or SequenceMatcher(None, entity_fold, gold_fold).ratio() >= 0.85:
+            return name
+    return None
 
 # ---------------------------------------------------------------------------
 # Verification flow
@@ -992,13 +1072,31 @@ async def process_verification(msg: Message, state: FSMContext) -> None:
     except Exception as exc:
         logger.error("Verification engine error for '%s': %s", clean_entity, exc)
 
+    # NEW — advisory notes appended to the verdict (never alter status / score)
+    try:
+        if status.startswith("לא ידוע"):
+            _lookalike = await _find_lookalike_gold(clean_entity)
+            if _lookalike:
+                verdict += (
+                    f"\n\n🎭 <b>אזהרת התחזות אפשרית:</b> השם דומה מאוד לשותף הזהב "
+                    f"<code>{_esc(_lookalike)}</code> אך אינו זהה לו. ודאו שאתם מדברים עם החשבון המקורי."
+                )
+            verdict += (
+                "\n\n💡 <b>המלצה:</b> בעסקה ראשונה השתמשו בגורם מתווך/ערב, "
+                "ואל תעבירו תשלום מראש לפני שהצד השני אומת."
+            )
+        elif trust_score == 0:
+            verdict += "\n\n⛔ <b>אל תעבירו כסף ואל תשלחו פרטים אישיים.</b> ניתן לדווח לנו על כל ניסיון פנייה."
+    except Exception as exc:
+        logger.debug("advisory notes skipped for '%s': %s", clean_entity, exc)
+
     filled = max(0, min(10, int(trust_score // 10)))
     bar    = "█" * filled + "░" * (10 - filled)
 
     report = (
         f"🛡️ <b>דוח אימות TELELINK</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔍 <b>ישות מבוקשת:</b> <code>{clean_entity}</code>\n"
+        f"🔍 <b>ישות מבוקשת:</b> <code>{_esc(clean_entity)}</code>\n"
         f"📅 <b>תאריך בדיקה:</b> {current_date}\n"
         f"🚦 <b>סטטוס מערכת:</b> {status}\n\n"
         f"<b>מדדי אבטחה (Trust Score):</b>\n"
@@ -1012,6 +1110,10 @@ async def process_verification(msg: Message, state: FSMContext) -> None:
         inline_keyboard=[
             [InlineKeyboardButton(text="🚨 דווחו על הונאה",     callback_data=f"report_scam_direct:{clean_entity}")],
             [InlineKeyboardButton(text=get_button_text("geza_bot"), url=get_button_url("geza_bot"))],
+            [
+                InlineKeyboardButton(text="🔍 בדיקה נוספת", callback_data="check_entity"),
+                InlineKeyboardButton(text="💡 טיפים לבטיחות", callback_data="safety_tips"),
+            ],
             [InlineKeyboardButton(text="🔍 חזרה לתפריט הראשי", callback_data="main_menu")],
         ]
     )
@@ -1149,6 +1251,32 @@ def _evidence_queue_keyboard(report_id: str, index: int, total: int) -> InlineKe
     return builder.as_markup()
 
 
+async def _notify_reporter_outcome(bot: Optional[Bot], entry: Dict[str, Any], approved: bool) -> None:
+    """NEW — tell the reporter their case was closed. Never raises (user may have blocked the bot)."""
+    reporter_id = entry.get("reporter")
+    if not bot or not reporter_id:
+        return
+    case_id = _esc(entry.get("id"))
+    if approved:
+        text = (
+            f"✅ <b>עדכון על הדיווח שלכם — תיק #{case_id}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "צוות האבטחה בחן את הראיות <b>ואישר את הדיווח</b>.\n"
+            "הישות נוספה לרשימה השחורה הגלובלית, וכל הקהילה מוגנת בזכותכם. 🙏"
+        )
+    else:
+        text = (
+            f"ℹ️ <b>עדכון על הדיווח שלכם — תיק #{case_id}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "הצוות בחן את התיק ולא מצא בשלב זה די ראיות לחסימה.\n"
+            "יש לכם ראיות נוספות? ניתן לפתוח תיק חדש בכל עת דרך התפריט הראשי."
+        )
+    try:
+        await bot.send_message(int(reporter_id), text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logger.info("Could not notify reporter %s about case %s: %s", reporter_id, entry.get("id"), exc)
+
+
 async def _deliver_report_packet(bot: Bot, chat_id: int, entry: Dict[str, Any], *, pending_count: Optional[int] = None) -> None:
     """
     Send the report SUMMARY only, with a "🔍 הצג ראיות" button — a clean,
@@ -1257,7 +1385,7 @@ async def report_username(msg: Message, state: FSMContext) -> None:
     await state.set_state(ReportFlow.waiting_proof)
     try:
         await msg.answer(
-            f"✅ הישות <code>{clean_username}</code> נקלטה במערכת.\n\n"
+            f"✅ הישות <code>{_esc(clean_username)}</code> נקלטה במערכת.\n\n"
             "<b>שלב 2 מתוך 3 — צירוף ראיות</b>\n"
             "לצורך בחינה מקצועית של התיק, אנא צרפו תיעוד תומך:\n"
             "📸 ניתן לשלוח <u>כמה תמונות שתרצו</u> (צילומי מסך של ההתכתבות / העברה הכספית), <u>וגם</u>\n"
@@ -1418,7 +1546,7 @@ async def direct_report(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ReportFlow.waiting_proof)
     try:
         await call.message.answer(  # type: ignore[union-attr]
-            f"🚨 <b>פתיחת תיק דיווח — יעד:</b> <code>@{entity}</code>\n\n"
+            f"🚨 <b>פתיחת תיק דיווח — יעד:</b> <code>@{_esc(entity)}</code>\n\n"
             "<b>שלב 2 מתוך 3 — צירוף ראיות</b>\n"
             "ניתן לשלוח כמה תמונות שתרצו, וגם קישור/טקסט המהווה הוכחה להונאה.\n"
             "לחצו \"✅ סיימתי לצרף ראיות\" כשתסיימו:",
@@ -2789,6 +2917,7 @@ async def approve_report_inline(call: CallbackQuery) -> None:
         reports = await load_reports()
         for r in reports:
             if r.get("id") == report_id:
+                _prev_status = r.get("status")
                 r["status"] = "approved"
                 target       = normalize_entity(r.get("username", ""))
                 blacklist    = await load_blacklist()
@@ -2806,8 +2935,11 @@ async def approve_report_inline(call: CallbackQuery) -> None:
                 await _finish_review_notice(
                     call,
                     f"✅ <b>התיק #{report_id} אושר ונסגר.</b>\n"
-                    f"🎯 הישות <code>{target}</code> נחסמה והתווספה לרשימה השחורה הגלובלית.",
+                    f"🎯 הישות <code>{_esc(target)}</code> נחסמה והתווספה לרשימה השחורה הגלובלית.",
                 )
+                if _prev_status == "pending":
+                    await _notify_reporter_outcome(call.bot, r, approved=True)
+                await log_audit(call.from_user.id, "approve_report", target, f"תיק #{report_id}")
                 break
         await save_reports(reports)
 
@@ -2830,11 +2962,15 @@ async def reject_report_inline(call: CallbackQuery) -> None:
         reports = await load_reports()
         for r in reports:
             if r.get("id") == report_id:
+                _prev_status = r.get("status")
                 r["status"] = "rejected"
                 await _finish_review_notice(
                     call,
                     f"❌ <b>התיק #{report_id} נדחה ונסגר</b> — הראיות שנבדקו לא הצדיקו חסימה.",
                 )
+                if _prev_status == "pending":
+                    await _notify_reporter_outcome(call.bot, r, approved=False)
+                await log_audit(call.from_user.id, "reject_report", str(r.get("username", "")), f"תיק #{report_id}")
                 break
         await save_reports(reports)
     except Exception as exc:

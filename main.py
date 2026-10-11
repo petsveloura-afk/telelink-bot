@@ -82,12 +82,41 @@ except ImportError as exc:
     logger.critical("❌ config.py missing or incomplete: %s", exc)
     sys.exit(1)
 
+# NEW — Railway's disk is ephemeral. Bring back users / buttons / admins / audit
+# files from their Postgres mirror before handlers.py reads them at import time.
+try:
+    import db_local as _db_local
+
+    async def _restore_files_once() -> None:
+        try:
+            restored = await _db_local.restore_files()
+            if restored:
+                logger.info("♻️ Restored %d local file(s) from Postgres", restored)
+        finally:
+            # the pool must not outlive this temporary event loop
+            await _db_local.close_pool()
+
+    if os.getenv("DATABASE_URL"):
+        asyncio.run(_restore_files_once())
+except Exception as _restore_exc:  # never block start-up on a restore problem
+    logger.warning("⚠️ File restore skipped: %s", _restore_exc)
+
 try:
     from handlers import router as handlers_router
     logger.info("✅ All modules loaded successfully")
 except ImportError as exc:
     logger.critical("❌ Import error from handlers.py: %s", exc)
     sys.exit(1)
+
+# NEW — Experience Pack (extra commands, safety center, FAQ, anti-spam).
+# Optional by design: if it fails to import, the bot runs exactly as before.
+try:
+    from extras import router as extras_router, ThrottleMiddleware
+    logger.info("✅ Experience Pack loaded")
+except Exception as exc:  # noqa: BLE001
+    extras_router = None  # type: ignore[assignment]
+    ThrottleMiddleware = None  # type: ignore[assignment,misc]
+    logger.warning("⚠️ extras.py not loaded: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -149,6 +178,10 @@ async def preflight_checks(bot: Bot) -> bool:
         commands = [
             BotCommand(command="start",  description="🚀 הפעלת הבוט"),
             BotCommand(command="help",   description="❓ עזרה ומידע"),
+            BotCommand(command="check",  description="🔍 בדיקת ישות: /check @username"),
+            BotCommand(command="tips",   description="🛡️ מרכז הבטיחות"),
+            BotCommand(command="faq",    description="💬 שאלות נפוצות"),
+            BotCommand(command="id",     description="🆔 המזהה שלי בטלגרם"),
             BotCommand(command="admin",  description="⚙️ פאנל ניהול (מנהלים בלבד)"),
         ]
         await bot.set_my_commands(commands)
@@ -156,6 +189,20 @@ async def preflight_checks(bot: Bot) -> bool:
         checks.append("COMMANDS_OK")
     except Exception as exc:
         logger.warning("⚠️ Could not set bot commands: %s", exc)
+
+    # 2b. Database connectivity (NEW — informative, never blocks start-up)
+    try:
+        from db_local import ping as _ping
+        if os.getenv("DATABASE_URL"):
+            if await _ping():
+                logger.info("✅ Postgres connection OK")
+                checks.append("DB_OK")
+            else:
+                logger.error("❌ Postgres unreachable — check DATABASE_URL (Neon)")
+        else:
+            logger.warning("⚠️ DATABASE_URL is not set — database-backed features will use safe defaults")
+    except Exception as exc:
+        logger.warning("⚠️ DB preflight skipped: %s", exc)
 
     # 3. Ensure data directory exists
     try:
@@ -239,6 +286,15 @@ async def start_health_server() -> None:
 
     app.router.add_get("/", health)
 
+    # NEW — richer probe for uptime monitors / Railway healthchecks
+    async def health_json(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"status": "ok", "uptime_seconds": int(time.time() - START_TIME), "service": "telelink-bot"}
+        )
+
+    app.router.add_get("/health", health_json)
+    app.router.add_get("/healthz", health_json)
+
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", "10000"))
@@ -272,6 +328,14 @@ async def main() -> None:
     # Register lifecycle hooks
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
+
+    # NEW — flood protection (admins exempt) + extra commands.
+    # extras_router is attached FIRST so its commands win over handlers.py's catch-all.
+    if ThrottleMiddleware is not None:
+        dp.message.outer_middleware(ThrottleMiddleware(limit=15, window=10.0))
+        dp.callback_query.outer_middleware(ThrottleMiddleware(limit=12, window=5.0))
+    if extras_router is not None:
+        dp.include_router(extras_router)
 
     # Attach routers
     dp.include_router(handlers_router)
@@ -309,6 +373,20 @@ async def main() -> None:
                 await storage.close()
             except Exception:
                 pass
+
+        # NEW — let in-flight DB mirror uploads finish, then close the Postgres pool
+        try:
+            import handlers as _handlers_mod
+            _mirrors = list(getattr(_handlers_mod, "_mirror_tasks", {}).values())
+            if _mirrors:
+                await asyncio.wait(_mirrors, timeout=8)
+        except Exception as exc:
+            logger.warning("⚠️ Error flushing DB mirrors: %s", exc)
+        try:
+            from db_local import close_pool as _close_pool
+            await _close_pool()
+        except Exception as exc:
+            logger.warning("⚠️ Error closing DB pool: %s", exc)
 
         current_task = asyncio.current_task()
         pending = [t for t in asyncio.all_tasks() if t is not current_task]

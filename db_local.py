@@ -21,14 +21,65 @@ Schema (created automatically on first use):
 
 import logging
 import os
+import re
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import asyncpg
 
 log = logging.getLogger("DB_Manager")
 
 DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
+
+
+# ---------------------------------------------------------------------------
+# Neon-friendly DSN handling (NEW)
+# Neon / Railway connection strings often carry libpq-only query parameters
+# (e.g. ``channel_binding=require``) that asyncpg forwards to the server as a
+# runtime setting, which makes the connection fail. We strip those, make sure
+# TLS is requested, and detect Neon's PgBouncer pooler endpoint (host contains
+# "-pooler"), where prepared-statement caching must be disabled.
+# ---------------------------------------------------------------------------
+_LIBPQ_ONLY_PARAMS = {"channel_binding", "options", "application_name", "target_session_attrs"}
+
+
+def _prepare_dsn(raw_dsn: str) -> str:
+    """Return a DSN asyncpg can use safely. Never raises; falls back to the raw value."""
+    if not raw_dsn:
+        return raw_dsn
+    try:
+        dsn = raw_dsn.strip().strip('"').strip("'")
+        if dsn.startswith("postgres://"):
+            dsn = "postgresql://" + dsn[len("postgres://"):]
+        parts = urlsplit(dsn)
+        query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                 if k.lower() not in _LIBPQ_ONLY_PARAMS]
+        keys = {k.lower() for k, _ in query}
+        host = (parts.hostname or "").lower()
+        is_local = host in ("localhost", "127.0.0.1", "::1", "")
+        if "sslmode" not in keys and "ssl" not in keys and not is_local:
+            query.append(("sslmode", "require"))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Could not normalise DATABASE_URL (%s) — using it as-is", exc)
+        return raw_dsn
+
+
+def _uses_pgbouncer(dsn: str) -> bool:
+    """True for Neon pooler hosts / explicit pgbouncer flag (needs statement_cache_size=0)."""
+    try:
+        host = (urlsplit(dsn).hostname or "").lower()
+    except Exception:
+        host = ""
+    return "-pooler" in host or "pgbouncer=true" in (dsn or "").lower()
+
+
+# Tiny in-process read cache for hot, rarely-changing keys (NEW). Keeps the
+# verification flow snappy and lowers load on a serverless Neon branch.
+_CACHE_TTL_SECONDS: float = float(os.environ.get("DB_CACHE_TTL", "5"))
+_json_cache: Dict[str, Any] = {}
 
 _pool: Optional[asyncpg.Pool] = None
 _schema_ready = False
@@ -43,7 +94,17 @@ async def _get_pool() -> asyncpg.Pool:
                 "DATABASE_URL is not set. Add a Postgres plugin on Railway "
                 "(or set the env var yourself) before starting the bot."
             )
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        _dsn = _prepare_dsn(DATABASE_URL)
+        _pool_kwargs: Dict[str, Any] = dict(
+            min_size=1,
+            max_size=int(os.environ.get("DB_POOL_MAX", "10")),
+            max_inactive_connection_lifetime=240,   # recycle idle conns before Neon suspends them
+            command_timeout=30,
+            timeout=30,
+        )
+        if _uses_pgbouncer(_dsn):
+            _pool_kwargs["statement_cache_size"] = 0  # required behind PgBouncer (transaction mode)
+        _pool = await asyncpg.create_pool(_dsn, **_pool_kwargs)
     if not _schema_ready:
         await _ensure_schema(_pool)
         _schema_ready = True
@@ -293,6 +354,13 @@ class DB:
     @staticmethod
     async def get_json(path: str, default: Any = None) -> Any:
         try:
+            _hit = _json_cache.get(path)
+            if _hit is not None and (time.monotonic() - _hit[0]) < _CACHE_TTL_SECONDS:
+                import copy as _copy
+                return _copy.deepcopy(_hit[1])
+        except Exception:
+            pass
+        try:
             pool = await _get_pool()
             async with pool.acquire() as conn:
                 row = await conn.fetchrow(
@@ -303,7 +371,13 @@ class DB:
             import json as _json
             value = row["value"]
             # asyncpg returns JSONB as str by default unless a codec is set
-            return _json.loads(value) if isinstance(value, str) else value
+            _val = _json.loads(value) if isinstance(value, str) else value
+            try:
+                import copy as _copy
+                _json_cache[path] = (time.monotonic(), _copy.deepcopy(_val))
+            except Exception:
+                pass
+            return _val
         except Exception as exc:
             log.error("Unexpected error in get_json('%s'): %s", path, exc)
             return default
@@ -324,6 +398,7 @@ class DB:
                     """,
                     path, _json.dumps(data, ensure_ascii=False),
                 )
+            _json_cache.pop(path, None)  # next read sees the fresh value
             return True
         except Exception as exc:
             log.error("Unexpected error in set_json('%s'): %s", path, exc)
@@ -346,3 +421,82 @@ class DB:
 def _to_jsonb_safe(data: Any) -> str:
     import json as _json
     return _json.dumps(data, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# NEW — lifecycle + persistence helpers
+# ---------------------------------------------------------------------------
+async def close_pool() -> None:
+    """Close the shared pool cleanly (called on bot shutdown / before loop change)."""
+    global _pool, _schema_ready
+    if _pool is not None:
+        try:
+            await _pool.close()
+            log.info("🔌 Postgres pool closed")
+        except Exception as exc:
+            log.warning("Error closing Postgres pool: %s", exc)
+    _pool = None
+    _schema_ready = False
+    _json_cache.clear()
+
+
+async def ping() -> bool:
+    """Cheap connectivity probe used by preflight / health checks. Never raises."""
+    try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
+            return (await conn.fetchval("SELECT 1")) == 1
+    except Exception as exc:
+        log.error("DB ping failed: %s", exc)
+        return False
+
+
+# Local JSON files that the bot writes to disk. Railway's filesystem is
+# ephemeral (wiped on every deploy), so each of these is mirrored into
+# Postgres (kv_store key "files/<name>") and restored on start-up if missing.
+MIRRORED_FILES = (
+    "users.json",
+    "buttons.json",
+    "custom_buttons.json",
+    "admins_extra.json",
+    "audit_log.json",
+)
+
+
+async def mirror_file(name: str, data: Any) -> bool:
+    """Persist a local JSON file's content in Postgres. Never raises."""
+    if name not in MIRRORED_FILES:
+        return False
+    return await DB.set_json(f"files/{name}", data)
+
+
+async def restore_files(data_dir: str = "data") -> int:
+    """
+    Recreate any missing local JSON file from its Postgres mirror.
+    Existing local files are never overwritten. Returns the number of files restored.
+    """
+    import json as _json
+    restored = 0
+    if not DATABASE_URL:
+        log.info("DATABASE_URL not set — skipping file restore")
+        return 0
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except OSError as exc:
+        log.error("Cannot create %s: %s", data_dir, exc)
+        return 0
+    for name in MIRRORED_FILES:
+        path = os.path.join(data_dir, name)
+        if os.path.exists(path):
+            continue
+        try:
+            payload = await DB.get_json(f"files/{name}", None)
+            if payload is None:
+                continue
+            with open(path, "w", encoding="utf-8") as fh:
+                _json.dump(payload, fh, ensure_ascii=False, indent=2)
+            restored += 1
+            log.info("♻️ Restored %s from Postgres", name)
+        except Exception as exc:
+            log.warning("Could not restore %s: %s", name, exc)
+    return restored
