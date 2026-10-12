@@ -14,7 +14,7 @@ import os
 import re
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ParseMode
@@ -209,6 +209,22 @@ def clean_tg_username(raw_name: str) -> str:
     text = str(raw_name).strip()
     text = text.replace("https://t.me/", "").replace("t.me/", "").replace("@", "")
     return "".join(re.findall(r"[a-zA-Z0-9_]+", text))
+
+
+def _original_name(raw_input: str) -> str:
+    """
+    NEW — same clean-up as normalize_entity (scheme / t.me / @ / path / query) but WITHOUT
+    lower-casing, so a name is displayed exactly the way the admin / reporter typed it.
+    Returns "" if the result would not match normalize_entity (safety net).
+    """
+    if not raw_input:
+        return ""
+    text = re.sub(r"(?i)(https?://|t\.me/|telegram\.me/)", "", str(raw_input).strip())
+    text = text.replace("@", "").strip()
+    if "/" in text:
+        text = text.split("/")[-1]
+    text = text.split("?")[0].strip()
+    return text if text.lower() == normalize_entity(raw_input) else ""
 
 
 def _truncate(text: str, max_len: int = 200) -> str:
@@ -1654,46 +1670,168 @@ async def quick_features(call: CallbackQuery) -> None:
         await call.answer()
 
 # ---------------------------------------------------------------------------
+# Shared list helpers (pagination + exact-name display) — used by Blacklist & Gold screens
+# ---------------------------------------------------------------------------
+_LIST_PAGE_SIZE = 8
+
+
+def _page_bounds(total: int, page: int) -> Tuple[int, int, int, int]:
+    """Return (page, pages, start, end) with `page` clamped to a valid range."""
+    pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    page = max(0, min(int(page), pages - 1))
+    start = page * _LIST_PAGE_SIZE
+    return page, pages, start, min(start + _LIST_PAGE_SIZE, total)
+
+
+def _pager_row(prefix: str, page: int, pages: int) -> List[InlineKeyboardButton]:
+    """⏮ ⬅️ 📄 2/5 ➡️ ⏭ — only the arrows that make sense for the current page."""
+    row: List[InlineKeyboardButton] = []
+    if page > 1:
+        row.append(InlineKeyboardButton(text="⏮", callback_data=f"{prefix}:0"))
+    if page > 0:
+        row.append(InlineKeyboardButton(text="⬅️ הקודם", callback_data=f"{prefix}:{page - 1}"))
+    row.append(InlineKeyboardButton(text=f"📄 {page + 1}/{pages}", callback_data="list_noop"))
+    if page < pages - 1:
+        row.append(InlineKeyboardButton(text="הבא ➡️", callback_data=f"{prefix}:{page + 1}"))
+    if page < pages - 2:
+        row.append(InlineKeyboardButton(text="⏭", callback_data=f"{prefix}:{pages - 1}"))
+    return row
+
+
+def _btn_label(text: str, limit: int = 34) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _bl_display(key: str, item: Optional[Dict[str, Any]]) -> str:
+    """Name exactly as it was typed when the record was created (falls back to the stored key)."""
+    shown = str((item or {}).get("display_name") or "").strip()
+    return shown or clean_tg_username(key) or str(key)
+
+
+def _gold_display(item: Dict[str, Any]) -> str:
+    shown = str(item.get("display_name") or "").strip()
+    return shown or clean_tg_username(item.get("name", "")) or str(item.get("name", "N/A"))
+
+
+@router.callback_query(F.data == "list_noop")
+async def list_noop(call: CallbackQuery) -> None:
+    await call.answer()
+
+# ---------------------------------------------------------------------------
 # Global blacklist index
 # ---------------------------------------------------------------------------
+async def _render_blacklist_page(call: CallbackQuery, page: int = 0) -> None:
+    blacklist = await load_blacklist()
+    if not blacklist:
+        await call.message.edit_text(  # type: ignore[union-attr]
+            "🌍 <b>רשימה שחורה עולמית (Global Blacklist)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "✨ <b>המערכת נקייה כרגע.</b>\n"
+            "לא התקבלו דיווחים גלובליים לאחרונה.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=telelink_main_menu(),
+        )
+        return
+
+    items = list(blacklist.items())
+    page, pages, start, end = _page_bounds(len(items), page)
+
+    builder = InlineKeyboardBuilder()
+    for idx in range(start, end):
+        name, data = items[idx]
+        cb = f"show_bl_post:{name}"
+        if len(cb.encode("utf-8")) > 64:      # Telegram limit — fall back to an index-based callback
+            cb = f"show_bl_idx:{idx}"
+        builder.row(InlineKeyboardButton(text=f"🚫 {_btn_label(_bl_display(name, data))}", callback_data=cb))
+    if pages > 1:
+        builder.row(*_pager_row("bl_page", page, pages))
+    builder.row(
+        InlineKeyboardButton(text="🔍 בדיקת ישות", callback_data="check_entity"),
+        InlineKeyboardButton(text="🏠 תפריט ראשי", callback_data="main_menu"),
+    )
+
+    await call.message.edit_text(  # type: ignore[union-attr]
+        "🌍 <b>מאגר הדיווחים הגלובלי — TELELINK</b>\n"
+        "<i>ישויות שנמצאו לא אמינות במערכת</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 סה״כ ברשימה: <b>{len(items)}</b>   ·   📄 עמוד <b>{page + 1}/{pages}</b>\n"
+        f"👁️ מוצגות: <b>{start + 1}–{end}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ <b>שימו לב:</b> הרשימה כוללת ישויות שדווחו על הונאה.\n"
+        "👇 <b>לחצו על שם לצפייה בפרטי הנוכל ובראיות:</b>",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @router.callback_query(F.data == "global_blacklist")
 async def view_global_blacklist_index(call: CallbackQuery) -> None:
     try:
-        blacklist = await load_blacklist()
-        if not blacklist:
-            await call.message.edit_text(  # type: ignore[union-attr]
-                "🌍 <b>רשימה שחורה עולמית (Global Blacklist)</b>\n\n"
-                "המערכת נקייה כרגע. לא התקבלו דיווחים גלובליים לאחרונה.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=telelink_main_menu(),
-            )
-            return
-
-        builder = InlineKeyboardBuilder()
-        for name, data in blacklist.items():
-            reason      = data.get("comment", "דיווח הונאה")
-            button_text = (reason[:30] + "...") if len(reason) > 30 else reason
-            builder.row(
-                InlineKeyboardButton(
-                    text=f"❌ {button_text} • לדו''ח",
-                    callback_data=f"show_bl_post:{name}",
-                )
-            )
-        builder.row(InlineKeyboardButton(text="🏠 חזרה לתפריט הראשי", callback_data="main_menu"))
-
-        await call.message.edit_text(  # type: ignore[union-attr]
-            "🌍 <b>מאגר הדיווחים הגלובלי — TELELINK</b>\n"
-            "<i>רשימת ישויות שנמצאו לא אמינות במערכת</i>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "⚠️ <b>שימו לב:</b> הרשימה מטה כוללת משתמשים שדווחו על הונאה.\n"
-            "לחצו על התיאור לצפייה בפרטי הנוכל ובראיות.",
-            reply_markup=builder.as_markup(),
-            parse_mode=ParseMode.HTML,
-        )
+        await _render_blacklist_page(call, 0)
     except Exception as exc:
         logger.error("view_global_blacklist_index error: %s", exc)
     finally:
         await call.answer()
+
+
+@router.callback_query(F.data.startswith("bl_page:"))
+async def blacklist_page_nav(call: CallbackQuery) -> None:
+    try:
+        page = int((call.data or "bl_page:0").split(":", 1)[1])
+        await _render_blacklist_page(call, page)
+    except Exception as exc:
+        logger.error("blacklist_page_nav error: %s", exc)
+    finally:
+        await call.answer()
+
+
+async def _render_blacklist_detail(call: CallbackQuery, target_name: str) -> None:
+    blacklist = await load_blacklist()
+    item      = blacklist.get(target_name)
+
+    if not item:
+        await call.answer("⚠️ הרשומה לא נמצאה", show_alert=True)
+        return
+
+    keys       = list(blacklist.keys())
+    position   = keys.index(target_name) + 1
+    back_page  = (position - 1) // _LIST_PAGE_SIZE
+    clean_name = clean_tg_username(target_name)
+    shown_name = _bl_display(target_name, item)
+    date_str   = str(item.get("timestamp", "2026-01-01"))[:10]
+
+    if clean_name:
+        who = f"<a href='https://t.me/{clean_name}'>@{_esc(shown_name)}</a>"
+    else:
+        who = f"<code>{_esc(shown_name)}</code>"
+
+    text = (
+        f"🚨 <b>דוח חשיפה רשמי — TELELINK</b> 🚨\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>ישות מדווחת:</b> {who}\n"
+        f"📊 <b>סטטוס מערכת:</b> ❌ <b>SCAMMER / BANNED</b>\n"
+        f"📅 <b>תאריך רישום:</b> {date_str}\n"
+        f"🔖 <b>רשומה:</b> #{position} מתוך {len(keys)}\n\n"
+        f"📝 <b>תיאור האירוע:</b>\n"
+        f"<blockquote>{_esc(_truncate(str(item.get('comment', 'קיימים דיווחי הונאה מאומתים.')), 500))}</blockquote>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡️ <b>אזהרה: הימנעו מכל התקשרות או סחר עם ישות זו!</b>\n"
+        f"💡 <i>קיבלתם פנייה מהישות הזו? ניתן לדווח לנו דרך התפריט הראשי.</i>"
+    )
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔙 חזרה לרשימה", callback_data=f"bl_page:{back_page}"))
+    builder.row(
+        InlineKeyboardButton(text="🔍 בדיקת ישות", callback_data="check_entity"),
+        InlineKeyboardButton(text="🏠 תפריט ראשי", callback_data="main_menu"),
+    )
+
+    await call.message.edit_text(  # type: ignore[union-attr]
+        text,
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 @router.callback_query(F.data.startswith("show_bl_post:"))
@@ -1702,42 +1840,25 @@ async def show_blacklist_post_detail(call: CallbackQuery) -> None:
     target_name = parts[1] if len(parts) > 1 else ""
 
     try:
-        blacklist = await load_blacklist()
-        item      = blacklist.get(target_name)
-
-        if not item:
-            await call.answer("⚠️ הרשומה לא נמצאה", show_alert=True)
-            return
-
-        clean_name = clean_tg_username(target_name)
-        date_str   = str(item.get("timestamp", "2026-01-01"))[:10]
-
-        text = (
-            f"🚨 <b>דוח חשיפה רשמי — TELELINK</b> 🚨\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>ישות מדווחת:</b> "
-            f"<a href='https://t.me/{clean_name}'>@{clean_name.upper()}</a>\n"
-            f"📊 <b>סטטוס מערכת:</b> ❌ <b>SCAMMER / BANNED</b>\n"
-            f"📅 <b>תאריך רישום:</b> {date_str}\n\n"
-            f"📝 <b>תיאור האירוע:</b>\n"
-            f"<blockquote>{_truncate(item.get('comment', 'קיימים דיווחי הונאה מאומתים.'), 500)}</blockquote>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🛡️ <b>אזהרה: הימנעו מכל התקשרות או סחר עם ישות זו!</b>"
-        )
-
-        builder = InlineKeyboardBuilder()
-        builder.row(InlineKeyboardButton(text="🔙 חזרה לרשימה",  callback_data="global_blacklist"))
-        builder.row(InlineKeyboardButton(text="🏠 תפריט ראשי",   callback_data="main_menu"))
-
-        await call.message.edit_text(  # type: ignore[union-attr]
-            text,
-            reply_markup=builder.as_markup(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-
+        await _render_blacklist_detail(call, target_name)
     except Exception as exc:
         logger.error("show_blacklist_post_detail error: %s", exc)
+    finally:
+        await call.answer()
+
+
+@router.callback_query(F.data.startswith("show_bl_idx:"))
+async def show_blacklist_detail_by_index(call: CallbackQuery) -> None:
+    """Index-based twin of show_bl_post (used when a name is too long for callback_data)."""
+    try:
+        idx  = int((call.data or "").split(":", 1)[1])
+        keys = list((await load_blacklist()).keys())
+        if idx < 0 or idx >= len(keys):
+            await call.answer("⚠️ הרשומה לא נמצאה", show_alert=True)
+            return
+        await _render_blacklist_detail(call, keys[idx])
+    except Exception as exc:
+        logger.error("show_blacklist_detail_by_index error: %s", exc)
     finally:
         await call.answer()
 
@@ -1802,7 +1923,7 @@ async def db_add_start(call: CallbackQuery, state: FSMContext) -> None:
 @router.message(AdminStates.waiting_db_add)
 async def db_add_process(msg: Message, state: FSMContext) -> None:
     entity = normalize_entity(msg.text or "")
-    await state.update_data(target=entity)
+    await state.update_data(target=entity, display_name=_original_name(msg.text or ""))
     await state.set_state(AdminStates.edit_comment)
     try:
         await msg.answer(
@@ -1831,6 +1952,7 @@ async def db_add_final_save(msg: Message, state: FSMContext) -> None:
             gold_list.append(
                 {
                     "name":       target,
+                    "display_name": data.get("display_name") or target,
                     "short_desc": (comment[:30] + "...") if len(comment) > 30 else comment,
                     "full_post":  comment,
                     "added_at":   datetime.now().isoformat(),
@@ -1849,6 +1971,7 @@ async def db_add_final_save(msg: Message, state: FSMContext) -> None:
             local_data = await load_blacklist()
             stats      = await load_stats()
             local_data[target] = {
+                "display_name": data.get("display_name") or target,
                 "status":    status,
                 "comment":   comment,
                 "timestamp": datetime.now().isoformat(),
@@ -2015,6 +2138,7 @@ async def handle_database_command(msg: Message, state: FSMContext) -> None:
                 gold_list.append(
                     {
                         "name":       entity,
+                        "display_name": _original_name(cmd[1]) or entity,
                         "short_desc": (comment[:30] + "...") if len(comment) > 30 else comment,
                         "full_post":  comment,
                         "added_at":   datetime.now().isoformat(),
@@ -2024,6 +2148,7 @@ async def handle_database_command(msg: Message, state: FSMContext) -> None:
             else:
                 local_data = await load_blacklist()
                 local_data[entity] = {
+                    "display_name": _original_name(cmd[1]) or entity,
                     "status":    status,
                     "comment":   comment,
                     "timestamp": datetime.now().isoformat(),
@@ -2922,6 +3047,7 @@ async def approve_report_inline(call: CallbackQuery) -> None:
                 target       = normalize_entity(r.get("username", ""))
                 blacklist    = await load_blacklist()
                 blacklist[target] = {
+                    "display_name": _original_name(r.get("username", "")) or target,
                     "status":    "scammer",
                     "comment":   f"דוח מאושר #{report_id}",
                     "timestamp": datetime.now().isoformat(),
@@ -2981,36 +3107,61 @@ async def reject_report_inline(call: CallbackQuery) -> None:
 # ---------------------------------------------------------------------------
 # Gold list index
 # ---------------------------------------------------------------------------
+async def _render_gold_page(call: CallbackQuery, page: int = 0) -> None:
+    gold_list = await load_gold_list()
+    if not gold_list:
+        await call.answer("✨ רשימת המומלצים מתעדכנת ברגעים אלו...", show_alert=True)
+        return
+
+    page, pages, start, end = _page_bounds(len(gold_list), page)
+
+    builder = InlineKeyboardBuilder()
+    for idx in range(start, end):
+        builder.row(
+            InlineKeyboardButton(
+                text=f"💎 {_btn_label(_gold_display(gold_list[idx]))}",
+                callback_data=f"sgp_idx:{idx}",
+            )
+        )
+    if pages > 1:
+        builder.row(*_pager_row("gld_page", page, pages))
+    builder.row(
+        InlineKeyboardButton(text="🔍 בדיקת ישות", callback_data="check_entity"),
+        InlineKeyboardButton(text="🏠 תפריט ראשי", callback_data="main_menu"),
+    )
+
+    await call.message.edit_text(  # type: ignore[union-attr]
+        "🏆 <b>נבחרת הזהב — Telelink Premium</b>\n"
+        "<i>אינדקס נותני שירות מאומתים</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 נותני שירות מאומתים: <b>{len(gold_list)}</b>   ·   📄 עמוד <b>{page + 1}/{pages}</b>\n"
+        f"👁️ מוצגים: <b>{start + 1}–{end}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ כל הישויות ברשימה עברו בדיקה והמלצה של צוות המערכת.\n"
+        "👇 <b>לחצו על שם לצפייה בהמלצה המפורטת:</b>",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
 @router.callback_query(F.data == "view_gold_list")
 async def view_gold_list_index(call: CallbackQuery) -> None:
     try:
-        gold_list = await load_gold_list()
-        if not gold_list:
-            await call.answer("✨ רשימת המומלצים מתעדכנת ברגעים אלו...", show_alert=True)
-            return
-
-        builder = InlineKeyboardBuilder()
-        for idx, item in enumerate(gold_list):
-            raw_name = clean_tg_username(item.get("name", "N/A"))
-            builder.row(
-                InlineKeyboardButton(
-                    text=f"💎 {raw_name.upper()} • לדו''ח המלא",
-                    callback_data=f"sgp_idx:{idx}",
-                )
-            )
-        builder.row(InlineKeyboardButton(text="🔙 חזרה לתפריט הראשי", callback_data="main_menu"))
-
-        await call.message.edit_text(  # type: ignore[union-attr]
-            "🏆 <b>נבחרת הזהב — Telelink Premium</b>\n"
-            "<i>אינדקס נותני שירות מאומתים</i>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "💡 <b>לבדיקת נותן שירות והמלצה מפורטת, לחצו מטה:</b>",
-            reply_markup=builder.as_markup(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        await _render_gold_page(call, 0)
     except Exception as exc:
         logger.error("view_gold_list_index error: %s", exc)
+    finally:
+        await call.answer()
+
+
+@router.callback_query(F.data.startswith("gld_page:"))
+async def gold_page_nav(call: CallbackQuery) -> None:
+    try:
+        page = int((call.data or "gld_page:0").split(":", 1)[1])
+        await _render_gold_page(call, page)
+    except Exception as exc:
+        logger.error("gold_page_nav error: %s", exc)
     finally:
         await call.answer()
 
@@ -3028,28 +3179,38 @@ async def show_gold_post_detail(call: CallbackQuery) -> None:
 
         item       = gold_list[idx]
         clean_name = clean_tg_username(item.get("name", ""))
+        shown_name = _gold_display(item)
         added_date = str(item.get("added_at", "2026-01-01"))[:10]
+        back_page  = idx // _LIST_PAGE_SIZE
 
         text = (
             f"💎 <b>דוח המלצה רשמי — נבחרת הזהב</b> 💎\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>ישות מאומתת:</b> @{clean_name}\n"
+            f"👤 <b>ישות מאומתת:</b> @{_esc(shown_name)}\n"
             f"📊 <b>סטטוס:</b> ✅ מומלץ / GOLD MEMBER\n"
-            f"📅 <b>תאריך הוספה:</b> {added_date}\n\n"
+            f"⭐ <b>דירוג אמינות:</b> ██████████ 100%\n"
+            f"📅 <b>תאריך הוספה:</b> {added_date}\n"
+            f"🔖 <b>רשומה:</b> #{idx + 1} מתוך {len(gold_list)}\n\n"
             f"📝 <b>פירוט המלצת המערכת:</b>\n"
-            f"<i>{_truncate(item.get('full_post', 'נותן שירות מאומת על ידי צוות המערכת — ללא חשש הונאה.'), 800)}</i>\n"
+            f"<blockquote>{_esc(_truncate(str(item.get('full_post', 'נותן שירות מאומת על ידי צוות המערכת — ללא חשש הונאה.')), 800))}</blockquote>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🛡️ <b>המלצת TELELINK:</b> ניתן לסחור ולהתקשר בביטחון!"
+            f"🛡️ <b>המלצת TELELINK:</b> ניתן לסחור ולהתקשר בביטחון!\n"
+            f"💡 <i>גם עם שותפי זהב — תמיד ודאו שמדובר בחשבון המקורי.</i>"
         )
 
         builder = InlineKeyboardBuilder()
-        builder.row(
-            InlineKeyboardButton(
-                text=f"🔗 פתיחת שיחה עם {clean_name}",
-                url=f"https://t.me/{clean_name}",
+        if clean_name:
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"🔗 פתיחת שיחה עם {_btn_label(shown_name, 28)}",
+                    url=f"https://t.me/{clean_name}",
+                )
             )
+        builder.row(InlineKeyboardButton(text="🔙 חזרה לרשימת המומלצים", callback_data=f"gld_page:{back_page}"))
+        builder.row(
+            InlineKeyboardButton(text="🔍 בדיקת ישות", callback_data="check_entity"),
+            InlineKeyboardButton(text="🏠 תפריט ראשי", callback_data="main_menu"),
         )
-        builder.row(InlineKeyboardButton(text="🔙 חזרה לרשימת המומלצים", callback_data="view_gold_list"))
 
         await call.message.edit_text(  # type: ignore[union-attr]
             text,
